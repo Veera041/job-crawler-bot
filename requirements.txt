@@ -4,3 +4,4 @@ pandas
 python-telegram-bot
 schedule
 selenium
+python-dotenv
