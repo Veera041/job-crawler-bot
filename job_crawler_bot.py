@@ -1,68 +1,49 @@
-import os
-import re
-import csv
-import json
-import time
-import asyncio
-import requests
-import pandas as pd
+import os, re, csv, json, time, asyncio, requests, pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Bot
 from dotenv import load_dotenv
 
-# ----------- CONFIG -----------
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-
-CSV_PATH = "cleaned_file.csv"
-SENT_STORE_PATH = "sent_jobs.json"
-REQUEST_TIMEOUT = 15
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
-)
-
-# CSV log
-LOG_FILE = "jobs_log.csv"
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Date", "Company", "Job Role", "Location", "Apply Link"])
-
-# Enable JS render via .env or hardcode
-ENV_JS = os.getenv("ENABLE_JS_RENDER", "false").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_JS_RENDER = ENV_JS  # you can also set True/False directly
-
-KEYWORDS = [
-    "career", "careers", "job", "jobs", "opening", "openings",
-    "vacancy", "vacancies", "apply", "opportunities", "recruitment"
-]
-
-DATE_OUTPUT_FMT = "%d/%m/%Y"  # 22/08/2025
-
-# ----------- TELEGRAM -----------
-if not BOT_TOKEN or not CHAT_ID:
-    raise RuntimeError("BOT_TOKEN / CHAT_ID missing. Set them in .env")
-
-bot = Bot(token=BOT_TOKEN)
-
-# ----------- OPTIONAL: Selenium fallback (lazy init) -----------
+# ---------------- SELENIUM ----------------
 driver = None
 selenium_ready = False
 
+# ---------------- CONFIG ----------------
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+CSV_PATH = "cleaned_file.csv"
+SENT_STORE_PATH = "sent_jobs.json"
+REQUEST_TIMEOUT = 15
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36")
+LOG_FILE = "jobs_log.csv"
+
+if not os.path.exists(LOG_FILE):
+    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Date","Company","Job Role","Location","Apply Link"])
+
+ENABLE_JS_RENDER = os.getenv("ENABLE_JS_RENDER","false").strip().lower() in {"1","true","yes","on"}
+KEYWORDS = ["career","careers","job","jobs","opening","openings","vacancy","vacancies","apply","opportunities","recruitment"]
+RESTRICTED_DOMAINS = ["facebook.com","linkedin.com","twitter.com","instagram.com"]
+DATE_OUTPUT_FMT = "%d/%m/%Y"
+
+if not BOT_TOKEN or not CHAT_ID:
+    raise RuntimeError("BOT_TOKEN / CHAT_ID missing in .env")
+bot = Bot(token=BOT_TOKEN)
+
+# ---------------- SELENIUM INIT ----------------
 def init_selenium_if_needed():
-    """Init Selenium lazily only when required; auto-manage chromedriver."""
-    global driver, selenium_ready, ENABLE_JS_RENDER
+    global driver, selenium_ready
     if not ENABLE_JS_RENDER or selenium_ready:
         return
-
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
         from webdriver_manager.chrome import ChromeDriverManager
 
         chrome_opts = Options()
@@ -71,333 +52,219 @@ def init_selenium_if_needed():
         chrome_opts.add_argument("--disable-dev-shm-usage")
         chrome_opts.add_argument(f"--user-agent={USER_AGENT}")
         chrome_opts.add_argument("--window-size=1366,768")
+        chrome_opts.add_argument("--log-level=3")
+        chrome_opts.add_experimental_option("excludeSwitches", ["enable-logging"])
+        chrome_opts.add_experimental_option('useAutomationExtension', False)
 
-        driver = webdriver.Chrome(ChromeDriverManager().install(), options=chrome_opts)
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_opts)
         selenium_ready = True
-        print("[Selenium] Headless Chrome initialized.")
+        print("[Selenium] Headless Chrome initialized (clean logs).")
     except Exception as e:
-        print(f"[WARN] Selenium init failed (JS render disabled): {e}")
+        print(f"[WARN] Selenium init failed: {e}")
         driver = None
         selenium_ready = False
-        # Don’t flip ENABLE_JS_RENDER to False; keep user intent, but proceed without JS.
 
-def js_get_html(url: str) -> str | None:
-    """Render with Selenium (if available)."""
+def js_get_html(url: str):
     init_selenium_if_needed()
     if not selenium_ready or driver is None:
         return None
     try:
         driver.get(url)
-        time.sleep(2.5)  # allow render
+        time.sleep(2.5)
         return driver.page_source
-    except Exception as e:
-        print(f"[ERROR] Selenium GET {url}: {e}")
+    except:
         return None
 
-# ----------- PERSIST ----------
-def load_sent() -> set:
+# ---------------- PERSISTENCE ----------------
+def load_sent():
     if os.path.exists(SENT_STORE_PATH):
         try:
-            with open(SENT_STORE_PATH, "r", encoding="utf-8") as f:
+            with open(SENT_STORE_PATH,"r",encoding="utf-8") as f:
                 return set(json.load(f))
-        except Exception:
+        except:
             return set()
     return set()
 
-def save_sent(s: set):
+def save_sent(s):
     try:
-        with open(SENT_STORE_PATH, "w", encoding="utf-8") as f:
+        with open(SENT_STORE_PATH,"w",encoding="utf-8") as f:
             json.dump(sorted(list(s)), f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[WARN] Couldn't save sent store: {e}")
+    except:
+        pass
 
 sent_jobs = load_sent()
 
-# ----------- HTTP -----------
-def get_html(url: str) -> str | None:
+# ---------------- HTTP FETCH ----------------
+def get_html(url: str):
+    if not url.startswith("http"):
+        return None
+    for d in RESTRICTED_DOMAINS:
+        if d in url.lower():
+            return None
     try:
         headers = {"User-Agent": USER_AGENT}
         resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             return resp.text
-        print(f"[HTTP {resp.status_code}] {url}")
         return None
-    except Exception as e:
-        print(f"[ERROR] GET {url}: {e}")
+    except:
         return None
 
-def page_looks_unrendered(html: str) -> bool:
-    """Heuristic: if page is too script-heavy / low text / no anchors with keywords, try JS render."""
-    if not html:
-        return True
-    soup = BeautifulSoup(html, "html.parser")
-    text_len = len(soup.get_text(" ").strip())
-    anchors = soup.find_all("a", href=True)
-    has_kw = any(looks_like_job_text(a.get_text()) or looks_like_job_url(a.get("href", "")) for a in anchors)
-    many_scripts = len(soup.find_all("script")) > 20
-    return (text_len < 800 and many_scripts) or (not has_kw and many_scripts)
-
-def fetch_page(url: str) -> str | None:
-    """Requests first; if looks unrendered and JS enabled, try Selenium."""
+def fetch_page(url: str):
     html = get_html(url)
     if html:
-        if ENABLE_JS_RENDER and page_looks_unrendered(html):
-            rendered = js_get_html(url)
-            return rendered or html
         return html
-    # requests failed → try JS if enabled
     if ENABLE_JS_RENDER:
         return js_get_html(url)
     return None
 
-# ----------- UTIL -----------
-def normalize_url(base: str, href: str) -> str:
+# ---------------- UTILS ----------------
+def normalize_url(base, href):
     absolute = urljoin(base, href)
     parsed = urlparse(absolute)
     return parsed._replace(fragment="").geturl()
 
-def looks_like_job_text(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return any(k in t for k in KEYWORDS)
+def collapse_spaces(s: str):
+    return re.sub(r"\s+"," ", s or "").strip()
 
-def looks_like_job_url(url: str) -> bool:
-    u = (url or "").lower()
-    return any(k in u for k in KEYWORDS)
-
-def collapse_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-# ----------- DATE PARSING -----------
+# ---------------- DATE PARSING ----------------
 DATE_PATTERNS = [
     r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
     r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
-    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{2,4}\b",
-    r"\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?,?\s+\d{2,4}\b",
+    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{2,4}\b",
+    r"\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s+\d{2,4}\b"
 ]
 DATE_RE = re.compile("|".join(DATE_PATTERNS), re.IGNORECASE)
 
-def parse_any_date(s: str) -> datetime | None:
+def parse_any_date(s):
     s = s.strip()
-    fmts = [
-        "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y",
-        "%d/%m/%y", "%d-%m-%y", "%Y/%m/%d",
-        "%b %d %Y", "%b %d, %Y", "%d %b %Y", "%d %b, %Y",
-        "%B %d %Y", "%B %d, %Y", "%d %B %Y", "%d %B, %Y",
-    ]
+    fmts = ["%d/%m/%Y","%d-%m-%Y","%Y-%m-%d","%m/%d/%Y","%m-%d-%Y",
+            "%d/%m/%y","%d-%m-%y","%Y/%m/%d",
+            "%b %d %Y","%b %d, %Y","%d %b %Y","%d %b, %Y",
+            "%B %d %Y","%B %d, %Y","%d %B %Y","%d %B, %Y"]
     for fmt in fmts:
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            continue
+        try: return datetime.strptime(s, fmt)
+        except: continue
     return None
 
-def extract_date_from_text(text: str) -> str | None:
-    if not text:
-        return None
+def extract_date_from_text(text):
+    if not text: return None
     m = DATE_RE.search(text)
-    if not m:
-        return None
+    if not m: return None
     raw = m.group(0)
     dt = parse_any_date(raw)
-    if dt:
-        return dt.strftime(DATE_OUTPUT_FMT)
+    if dt: return dt.strftime(DATE_OUTPUT_FMT)
     return raw
 
-def extract_date_from_soup(soup: BeautifulSoup) -> str | None:
-    # JSON-LD JobPosting
-    for tag in soup.find_all("script", type=lambda v: v and "ld+json" in v):
-        try:
-            data = json.loads(tag.string or "{}")
-            items = data if isinstance(data, list) else [data]
-            for it in items:
-                t = (it.get("@type") or it.get("type") or "")
-                if isinstance(t, list):
-                    is_job = any(x.lower() == "jobposting" for x in t if isinstance(x, str))
-                else:
-                    is_job = isinstance(t, str) and t.lower() == "jobposting"
-                if is_job:
-                    date_posted = it.get("datePosted") or it.get("dateposted")
-                    if date_posted:
-                        try:
-                            dt = datetime.fromisoformat(date_posted.replace("Z", "+00:00"))
-                            return dt.strftime(DATE_OUTPUT_FMT)
-                        except Exception:
-                            return extract_date_from_text(date_posted)
-        except Exception:
-            pass
-
-    # <time> tags
+def extract_date_from_soup(soup):
     for tm in soup.find_all("time"):
         dt_attr = tm.get("datetime") or tm.get("aria-label") or ""
         txt = collapse_spaces(tm.get_text())
         val = extract_date_from_text(dt_attr or txt)
-        if val:
-            return val
+        if val: return val
+    return extract_date_from_text(collapse_spaces(soup.get_text()))
 
-    # meta tags
-    for name in ["article:published_time", "og:updated_time", "pubdate", "publishdate", "date"]:
-        m = soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
-        if m and (m.get("content")):
-            val = extract_date_from_text(m["content"])
-            if val:
-                return val
-
-    # labels
-    labels = ["posted", "date posted", "published", "updated", "last updated"]
-    for lbl in labels:
-        el = soup.find(string=re.compile(lbl, re.IGNORECASE))
-        if el:
-            around = collapse_spaces(el.parent.get_text()) if el.parent else ""
-            val = extract_date_from_text(around)
-            if val:
-                return val
-
-    body_text = collapse_spaces(soup.get_text(" "))
-    return extract_date_from_text(body_text)
-
-# ----------- TITLE -----------
-def extract_title_from_soup(soup: BeautifulSoup, fallback: str = "N/A") -> str:
+# ---------------- TITLE & LOCATION ----------------
+def extract_title_from_soup(soup, fallback="N/A"):
     if soup.title and soup.title.string:
         t = collapse_spaces(soup.title.string)
-        if 5 <= len(t) <= 140:
-            return t
-    for tag in ["h1", "h2", "h3", "h4"]:
+        if 5<=len(t)<=140: return t
+    for tag in ["h1","h2","h3","h4"]:
         h = soup.find(tag)
         if h:
             txt = collapse_spaces(h.get_text())
-            if 3 <= len(txt) <= 140:
-                return txt
+            if 3<=len(txt)<=140: return txt
     return fallback
 
-# ----------- SANITIZE MD -----------
-def md(text: str) -> str:
-    return (text or "").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+def extract_location_from_soup(soup):
+    txt = soup.get_text(" ")
+    m = re.search(r"\b(India|Bengaluru|Bangalore|Hyderabad|Chennai|Pune|Mumbai|Gurugram|Noida|Kolkata|Delhi)\b", txt, re.IGNORECASE)
+    if m: return m.group(0).title()
+    return "Not specified"
 
-# ----------- TELEGRAM SEND -----------
-async def send_job(company: str, title: str, posted_date: str | None, link: str, location: str = "Not specified"):
-    company_md = md(company)
-    title_md = md(title if title and title != "N/A" else "Job opening")
-    date_txt = posted_date if posted_date else "Not specified"
+# ---------------- TELEGRAM ----------------
+def md(text): return (text or "").replace("_","\\_").replace("*","\\*").replace("`","\\`")
 
-    message = (
-        f"💼 {title_md}\n"
-        f"🏢 *{company_md}*\n"
-        f"📅 Posted: {date_txt}\n"
-        f"📍 Location: {location}\n"
-        f"🔗 {link}"
-    )
+async def send_job(company,title,posted_date,link,location):
+    message = (f"💼 {md(title or 'Job opening')}\n🏢 *{md(company)}*\n📅 Posted: {posted_date or 'Not specified'}\n📍 Location: {location}\n🔗 {link}")
     try:
         await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
-
-        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        with open(LOG_FILE,"a",newline="",encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([date_txt, company, title, location, link])
-
+            writer.writerow([posted_date or "",company,title,location,link])
         sent_jobs.add(link)
         await asyncio.sleep(0.5)
+    except: pass
 
-    except Exception as e:
-        print(f"[Telegram ERROR]: {e}")
-
-# ----------- CORE CRAWL -----------
-def extract_location_hint(soup: BeautifulSoup) -> str | None:
-    """Lightweight location hint from page text (best effort)."""
-    txt = soup.get_text(" ")
-    # very simple heuristic; extend as needed
-    m = re.search(r"\b(India|Bengaluru|Bangalore|Hyderabad|Chennai|Pune|Mumbai|Gurugram|Noida|Kolkata|Delhi)\b", txt, re.IGNORECASE)
-    if m:
-        return m.group(0).title()
-    return None
+# ---------------- CRAWL ----------------
+def is_recent(posted_date):
+    if not posted_date: return False
+    try:
+        dt = datetime.strptime(posted_date, DATE_OUTPUT_FMT)
+        return datetime.now()-dt <= timedelta(days=1)
+    except: return False
 
 async def crawl_jobs_once():
     print("🔍 Crawling started...")
-    try:
-        df = pd.read_csv(CSV_PATH)
-    except Exception as e:
-        print(f"[ERROR] Can't read {CSV_PATH}: {e}")
-        return
+    try: df = pd.read_csv(CSV_PATH)
+    except:
+        print(f"[ERROR] Can't read {CSV_PATH}"); return
 
-    for col in ("Company Name", "Website"):
+    for col in ("Company Name","Website"):
         if col not in df.columns:
-            print(f"[ERROR] CSV missing required column: {col}")
-            return
+            print(f"[ERROR] CSV missing: {col}"); return
 
-    new_count = 0
-    for _, row in df.iterrows():
-        company = str(row["Company Name"]).strip()
-        site = str(row["Website"]).strip()
-        if not site.startswith("http"):
-            print(f"[SKIP] Invalid URL for {company}: {site}")
-            continue
+    new_count=0
+    for _,row in df.iterrows():
+        company=str(row["Company Name"]).strip()
+        site=str(row["Website"]).strip()
+        if not site.startswith("http"): continue
 
-        html = fetch_page(site)
-        if not html:
-            continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        anchors = soup.find_all("a", href=True)
-        seen_here = set()
+        html=fetch_page(site)
+        if not html: continue
+        soup=BeautifulSoup(html,"html.parser")
+        anchors=soup.find_all("a",href=True)
+        seen_here=set()
 
         for a in anchors:
-            href = a.get("href", "").strip()
-            text = collapse_spaces(a.get_text(" ").strip())
-            if not href:
-                continue
-
-            full_link = normalize_url(site, href)
-            if full_link in seen_here:
-                continue
+            href=a.get("href").strip()
+            if not href or href.lower().startswith("javascript:") or href.startswith("#"): continue
+            full_link=normalize_url(site,href)
+            if full_link in seen_here or full_link in sent_jobs: continue
             seen_here.add(full_link)
 
-            if not (looks_like_job_text(text) or looks_like_job_url(full_link)):
-                continue
+            job_html=fetch_page(full_link)
+            if not job_html: continue
+            job_soup=BeautifulSoup(job_html,"html.parser")
 
-            if full_link in sent_jobs:
-                continue
+            title=extract_title_from_soup(job_soup, fallback=a.get_text(" ").strip())
+            posted=extract_date_from_soup(job_soup)
+            if not is_recent(posted): continue
+            location=extract_location_from_soup(job_soup)
 
-            # Visit job/careers page to extract accurate info
-            job_html = fetch_page(full_link)
-            if job_html:
-                job_soup = BeautifulSoup(job_html, "html.parser")
-                title = extract_title_from_soup(job_soup, fallback=text or "N/A")
-                posted = extract_date_from_soup(job_soup)
-                location_hint = extract_location_hint(job_soup) or "Not specified"
-            else:
-                title = text or "N/A"
-                posted = None
-                location_hint = "Not specified"
-
-            await send_job(company, title, posted, full_link, location_hint)
+            await send_job(company,title,posted,full_link,location)
             print(f"✅ Sent: {company} -> {full_link}")
-            sent_jobs.add(full_link)
-            new_count += 1
+            save_sent(sent_jobs)
+            new_count+=1
 
-            save_sent(sent_jobs)  # persist after each send
-            await asyncio.sleep(0.5)
+    print(f"🎉 {new_count} jobs sent." if new_count else "ℹ️ No new jobs this run.")
 
-    if new_count == 0:
-        print("ℹ️ No new jobs found this run.")
-    else:
-        print(f"🎉 {new_count} new jobs sent.")
-
-# ----------- MAIN LOOP (5 hours) -----------
+# ---------------- MAIN LOOP ----------------
 async def main():
-    print("✅ Bot is running (every 5 hours)…")
+    print("✅ Bot running (every 5 hours)...")
     while True:
         print(f"⏱️ Run at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         await crawl_jobs_once()
-        print("😴 Sleeping for 5 hours…\n")
-        await asyncio.sleep(5 * 60 * 60)
+        print("😴 Sleeping 5 hours...\n")
+        await asyncio.sleep(5*60*60)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("👋 Stopped. Saving…")
         save_sent(sent_jobs)
     finally:
         try:
-            if driver:
-                driver.quit()
-        except Exception:
-            pass
+            if driver: driver.quit()
+        except: pass
