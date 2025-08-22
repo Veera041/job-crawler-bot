@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+pandas
+python-telegram-bot
+schedule
+selenium
