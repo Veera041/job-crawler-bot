@@ -5,10 +5,6 @@ from datetime import datetime, timedelta
 from telegram import Bot
 from dotenv import load_dotenv
 
-# ---------------- SELENIUM ----------------
-driver = None
-selenium_ready = False
-
 # ---------------- CONFIG ----------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -36,6 +32,8 @@ if not BOT_TOKEN or not CHAT_ID:
 bot = Bot(token=BOT_TOKEN)
 
 # ---------------- SELENIUM INIT ----------------
+driver = None
+selenium_ready = False
 def init_selenium_if_needed():
     global driver, selenium_ready
     if not ENABLE_JS_RENDER or selenium_ready:
@@ -268,3 +266,6 @@ if __name__=="__main__":
         try:
             if driver: driver.quit()
         except: pass
+
+# ---------------- RENDER WORKER READY ----------------
+print("🚀 Ready for Render Worker (no port needed).")
