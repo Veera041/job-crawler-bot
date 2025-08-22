@@ -257,15 +257,26 @@ async def main():
         print("😴 Sleeping 5 hours...\n")
         await asyncio.sleep(5*60*60)
 
-if __name__=="__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        save_sent(sent_jobs)
-    finally:
-        try:
-            if driver: driver.quit()
-        except: pass
+# ---------------- FLASK WEB SERVER (FOR PORT) ----------------
+from flask import Flask
+import threading
 
-# ---------------- RENDER WORKER READY ----------------
-print("🚀 Ready for Render Worker (no port needed).")
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "✅ Job Crawler Bot is running!"
+
+# Run bot in background thread
+def run_bot():
+    import asyncio
+    asyncio.run(main())
+
+threading.Thread(target=run_bot).start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
+# ---------------- LOG ----------------
+print("🚀 Bot ready for Render Web Service (port bound).")
