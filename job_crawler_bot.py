@@ -57,7 +57,7 @@ def init_selenium_if_needed():
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_opts)
         selenium_ready = True
-        print("[Selenium] Headless Chrome initialized (clean logs).")
+        print("[Selenium] Headless Chrome initialized.")
     except Exception as e:
         print(f"[WARN] Selenium init failed: {e}")
         driver = None
@@ -69,7 +69,7 @@ def js_get_html(url: str):
         return None
     try:
         driver.get(url)
-        time.sleep(2.5)
+        time.sleep(2)
         return driver.page_source
     except:
         return None
@@ -200,7 +200,7 @@ def is_recent(posted_date):
     if not posted_date: return False
     try:
         dt = datetime.strptime(posted_date, DATE_OUTPUT_FMT)
-        return datetime.now()-dt <= timedelta(days=1)
+        return datetime.now()-dt <= timedelta(days=2)  # <-- 2-day filter
     except: return False
 
 async def crawl_jobs_once():
@@ -257,7 +257,7 @@ async def main():
         print("😴 Sleeping 5 hours...\n")
         await asyncio.sleep(5*60*60)
 
-# ---------------- FLASK WEB SERVER (FOR PORT) ----------------
+# ---------------- FLASK WEB SERVER ----------------
 from flask import Flask
 import threading
 
@@ -272,11 +272,10 @@ def run_bot():
     import asyncio
     asyncio.run(main())
 
-threading.Thread(target=run_bot).start()
+threading.Thread(target=run_bot, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 
-# ---------------- LOG ----------------
-print("🚀 Bot ready for Render Web Service (port bound).")
+print("🚀 Bot ready for Render Web Service.")
