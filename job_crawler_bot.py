@@ -1,7 +1,7 @@
 import os, re, csv, json, time, asyncio, requests, pandas as pd
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from datetime import datetime, timedelta
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
+from datetime import datetime
 from telegram import Bot
 from dotenv import load_dotenv
 
@@ -23,8 +23,18 @@ if not os.path.exists(LOG_FILE):
         writer.writerow(["Date","Company","Job Role","Location","Apply Link"])
 
 ENABLE_JS_RENDER = os.getenv("ENABLE_JS_RENDER","false").strip().lower() in {"1","true","yes","on"}
-KEYWORDS = ["career","careers","job","jobs","opening","openings","vacancy","vacancies","apply","opportunities","recruitment"]
-RESTRICTED_DOMAINS = ["facebook.com","linkedin.com","twitter.com","instagram.com"]
+
+CAREER_KEYWORDS = [
+    "career", "careers", "job", "jobs", "openings", "opportunities",
+    "vacancy", "vacancies", "recruit", "join-us", "joinus", "work-with-us",
+    "workwithus", "talent", "positions", "hiring"
+]
+EXCLUDE_PATTERNS = [
+    "blog", "event", "events", "news", "press", "media", "article", "insight",
+    "stories", "webinar", "podcast", "case-study", "casestudy", "whitepaper"
+]
+RESTRICTED_DOMAINS = ["facebook.com","linkedin.com","twitter.com","instagram.com","x.com","youtube.com"]
+
 DATE_OUTPUT_FMT = "%d/%m/%Y"
 
 if not BOT_TOKEN or not CHAT_ID:
@@ -118,13 +128,39 @@ def fetch_page(url: str):
     return None
 
 # ---------------- UTILS ----------------
+def collapse_spaces(s: str):
+    return re.sub(r"\s+"," ", s or "").strip()
+
+def canonicalize_url(url: str):
+    try:
+        parts = urlsplit(url)
+        fragment = ""
+        q = []
+        for k,v in parse_qsl(parts.query, keep_blank_values=True):
+            lk = k.lower()
+            if lk.startswith("utm_") or lk in {"gclid","fbclid","mc_cid","mc_eid","igshid"}:
+                continue
+            q.append((k,v))
+        query = urlencode(q, doseq=True)
+        netloc = parts.netloc.lower()
+        cleaned = urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+        if cleaned.endswith("//"):
+            cleaned = cleaned[:-1]
+        return cleaned
+    except:
+        return url
+
 def normalize_url(base, href):
     absolute = urljoin(base, href)
+    absolute = canonicalize_url(absolute)
     parsed = urlparse(absolute)
     return parsed._replace(fragment="").geturl()
 
-def collapse_spaces(s: str):
-    return re.sub(r"\s+"," ", s or "").strip()
+def same_host(a: str, b: str):
+    try:
+        return urlparse(a).netloc.split(":")[0].lower() == urlparse(b).netloc.split(":")[0].lower()
+    except:
+        return False
 
 # ---------------- DATE PARSING ----------------
 DATE_PATTERNS = [
@@ -142,8 +178,10 @@ def parse_any_date(s):
             "%b %d %Y","%b %d, %Y","%d %b %Y","%d %b, %Y",
             "%B %d %Y","%B %d, %Y","%d %B %Y","%d %B, %Y"]
     for fmt in fmts:
-        try: return datetime.strptime(s, fmt)
-        except: continue
+        try:
+            return datetime.strptime(s, fmt)
+        except:
+            continue
     return None
 
 def extract_date_from_text(text):
@@ -156,6 +194,18 @@ def extract_date_from_text(text):
     return raw
 
 def extract_date_from_soup(soup):
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if isinstance(it, dict) and str(it.get("@type","")).lower() == "jobposting":
+                    dp = it.get("datePosted") or it.get("validThrough")
+                    if dp:
+                        dt = parse_any_date(dp) or parse_any_date(dp.replace("T"," ").split("+")[0])
+                        if dt: return dt.strftime(DATE_OUTPUT_FMT)
+        except:
+            pass
     for tm in soup.find_all("time"):
         dt_attr = tm.get("datetime") or tm.get("aria-label") or ""
         txt = collapse_spaces(tm.get_text())
@@ -165,86 +215,174 @@ def extract_date_from_soup(soup):
 
 # ---------------- TITLE & LOCATION ----------------
 def extract_title_from_soup(soup, fallback="N/A"):
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        t = collapse_spaces(og.get("content"))
+        if 3 <= len(t) <= 140: return t
     if soup.title and soup.title.string:
         t = collapse_spaces(soup.title.string)
-        if 5<=len(t)<=140: return t
+        t = re.sub(r"\s+[-|–].*$", "", t).strip()
+        if 3 <= len(t) <= 140: return t
     for tag in ["h1","h2","h3","h4"]:
         h = soup.find(tag)
         if h:
             txt = collapse_spaces(h.get_text())
-            if 3<=len(txt)<=140: return txt
+            if 3 <= len(txt) <= 140: return txt
     return fallback
 
+CITY_WORDS = r"(?:India|Bengaluru|Bangalore|Hyderabad|Chennai|Pune|Mumbai|Gurugram|Gurgaon|Noida|Kolkata|Delhi|Remote|Anywhere)"
 def extract_location_from_soup(soup):
+    try:
+        for script in soup.find_all("script", type="application/ld+json"):
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if isinstance(it, dict) and str(it.get("@type","")).lower() == "jobposting":
+                    jl = it.get("jobLocation")
+                    if isinstance(jl, dict):
+                        addr = jl.get("address", {})
+                        parts = [addr.get("addressLocality"), addr.get("addressRegion"), addr.get("addressCountry")]
+                        loc = ", ".join([p for p in parts if p])
+                        if loc: return loc
+    except:
+        pass
     txt = soup.get_text(" ")
-    m = re.search(r"\b(India|Bengaluru|Bangalore|Hyderabad|Chennai|Pune|Mumbai|Gurugram|Noida|Kolkata|Delhi)\b", txt, re.IGNORECASE)
+    m = re.search(rf"\b{CITY_WORDS}\b", txt, re.IGNORECASE)
     if m: return m.group(0).title()
     return "Not specified"
 
-# ---------------- TELEGRAM ----------------
-def md(text): return (text or "").replace("_","\\_").replace("*","\\*").replace("`","\\`")
-
-async def send_job(company,title,posted_date,link,location):
-    message = (f"💼 {md(title or 'Job opening')}\n🏢 *{md(company)}*\n📅 Posted: {posted_date or 'Not specified'}\n📍 Location: {location}\n🔗 {link}")
+# ---------------- JOB PAGE HEURISTICS ----------------
+def looks_like_job_posting(soup, url: str):
+    u = url.lower()
+    if any(x in u for x in EXCLUDE_PATTERNS):
+        return False
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
+        for script in soup.find_all("script", type="application/ld+json"):
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if isinstance(it, dict) and str(it.get("@type","")).lower() == "jobposting":
+                    return True
+    except:
+        pass
+    body = soup.get_text(" ").lower()
+    signals = [
+        "apply now", "apply", "responsibilities", "requirements", "job description",
+        "what you will do", "role & responsibilities", "position summary"
+    ]
+    if sum(1 for s in signals if s in body) >= 2:
+        return True
+    if any(k in u for k in ["job","jobs","career","careers","opening","opportunity","position","vacancy"]):
+        return True
+    return False
+
+# ---------------- TELEGRAM ----------------
+async def send_job(company,title,posted_date,link,location):
+    message = (
+        f'role : "{collapse_spaces(title or "Job opening")}" , '
+        f'company name : {collapse_spaces(company)} , '
+        f'location : {collapse_spaces(location)} , '
+        f'apply link : {link}'
+    )
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode=None)
         with open(LOG_FILE,"a",newline="",encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([posted_date or "",company,title,location,link])
+            writer.writerow([posted_date or "", company, title, location, link])
         sent_jobs.add(link)
-        await asyncio.sleep(0.5)
-    except: pass
+        await asyncio.sleep(0.3)
+    except Exception as e:
+        print(f"[WARN] Telegram send failed: {e}")
+
+# ---------------- DISCOVERY ----------------
+def discover_career_pages(site_url: str, soup: BeautifulSoup):
+    career_pages = set()
+    for a in soup.find_all("a", href=True):
+        txt = collapse_spaces(a.get_text()).lower()
+        href = a["href"].strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        full = normalize_url(site_url, href)
+        if not same_host(site_url, full):
+            continue
+        u = full.lower()
+        if any(k in u for k in CAREER_KEYWORDS):
+            career_pages.add(full)
+    return career_pages or {site_url}
+
+def extract_job_links(career_url: str, soup: BeautifulSoup):
+    job_links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        full = normalize_url(career_url, href)
+        u = full.lower()
+        if any(x in u for x in EXCLUDE_PATTERNS):
+            continue
+        if any(k in u for k in ["job","jobs","opening","position","opportunity","careers","vacancy","gh_jid","lever.co","greenhouse.io","workable.com","smartrecruiters.com","myworkdayjobs.com"]):
+            job_links.add(full)
+    return job_links
 
 # ---------------- CRAWL ----------------
-def is_recent(posted_date):
-    if not posted_date: return False
-    try:
-        dt = datetime.strptime(posted_date, DATE_OUTPUT_FMT)
-        return datetime.now()-dt <= timedelta(days=2)  # <-- 2-day filter
-    except: return False
-
 async def crawl_jobs_once():
     print("🔍 Crawling started...")
-    try: df = pd.read_csv(CSV_PATH)
-    except:
-        print(f"[ERROR] Can't read {CSV_PATH}"); return
+    try:
+        df = pd.read_csv(CSV_PATH)
+    except Exception as e:
+        print(f"[ERROR] Can't read {CSV_PATH}: {e}")
+        return
 
     for col in ("Company Name","Website"):
         if col not in df.columns:
-            print(f"[ERROR] CSV missing: {col}"); return
+            print(f"[ERROR] CSV missing: {col}")
+            return
 
-    new_count=0
-    for _,row in df.iterrows():
-        company=str(row["Company Name"]).strip()
-        site=str(row["Website"]).strip()
-        if not site.startswith("http"): continue
+    new_count = 0
+    seen_global = set()
 
-        html=fetch_page(site)
-        if not html: continue
-        soup=BeautifulSoup(html,"html.parser")
-        anchors=soup.find_all("a",href=True)
-        seen_here=set()
+    for _, row in df.iterrows():
+        company = str(row["Company Name"]).strip()
+        site = str(row["Website"]).strip()
+        if not site.startswith("http"):
+            continue
 
-        for a in anchors:
-            href=a.get("href").strip()
-            if not href or href.lower().startswith("javascript:") or href.startswith("#"): continue
-            full_link=normalize_url(site,href)
-            if full_link in seen_here or full_link in sent_jobs: continue
-            seen_here.add(full_link)
+        home_html = fetch_page(site)
+        if not home_html:
+            continue
+        home_soup = BeautifulSoup(home_html, "html.parser")
 
-            job_html=fetch_page(full_link)
-            if not job_html: continue
-            job_soup=BeautifulSoup(job_html,"html.parser")
+        career_pages = discover_career_pages(site, home_soup)
 
-            title=extract_title_from_soup(job_soup, fallback=a.get_text(" ").strip())
-            posted=extract_date_from_soup(job_soup)
-            if not is_recent(posted): continue
-            location=extract_location_from_soup(job_soup)
+        candidate_job_links = set()
+        for page in career_pages:
+            ch = fetch_page(page)
+            if not ch:
+                continue
+            cs = BeautifulSoup(ch, "html.parser")
+            candidate_job_links |= extract_job_links(page, cs)
 
-            await send_job(company,title,posted,full_link,location)
-            print(f"✅ Sent: {company} -> {full_link}")
+        for link in candidate_job_links:
+            link = canonicalize_url(link)
+            if link in seen_global or link in sent_jobs:
+                continue
+            job_html = fetch_page(link)
+            if not job_html:
+                continue
+            job_soup = BeautifulSoup(job_html, "html.parser")
+
+            if not looks_like_job_posting(job_soup, link):
+                continue
+
+            title = extract_title_from_soup(job_soup, fallback="Job Opening")
+            posted = extract_date_from_soup(job_soup)
+            location = extract_location_from_soup(job_soup)
+
+            await send_job(company, title, posted, link, location)
+            print(f"✅ Sent: {company} -> {link}")
             save_sent(sent_jobs)
-            new_count+=1
+            seen_global.add(link)
+            new_count += 1
 
     print(f"🎉 {new_count} jobs sent." if new_count else "ℹ️ No new jobs this run.")
 
@@ -267,7 +405,6 @@ app = Flask(__name__)
 def home():
     return "✅ Job Crawler Bot is running!"
 
-# Run bot in background thread
 def run_bot():
     import asyncio
     asyncio.run(main())
